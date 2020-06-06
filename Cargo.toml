@@ -1,0 +1,14 @@
+[package]
+name = "librarius"
+version = "0.1.0"
+authors = ["Piotr Balcer <piotr@balcer.eu>"]
+edition = "2018"
+license = "BSD-3-Clause"
+
+[dependencies]
+snafu = "0.6.6"
+libc = "0.2.69"
+errno = "0.2.5"
+parking_lot = "0.10.2"
+crc32fast = "1.2.0"
+memoffset = "0.5.4"
