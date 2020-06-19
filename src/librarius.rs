@@ -18,7 +18,9 @@ impl<'data> Librarius<'data> {
     }
 
     pub fn attach(&mut self, source: impl Source + 'data) -> Result<()> {
-        self.las.attach(source)?;
+        self.las
+            .attach(source, |data| VersionedObjectStore::valid_page(data))?;
+
         Ok(())
     }
 
@@ -31,13 +33,14 @@ impl<'data> Librarius<'data> {
 
         let data = self.las.read(&root_location)?;
         let ptr_root: &UntypedPointer = unsafe_utils::any_from_slice(data);
+        if !ptr_root.is_some() {
+            let mut allocator = self.vos.new_object_allocator(self.las.boxed_page_alloc());
+            let (root, data) = allocator.alloc_new(size, Version::new_base())?;
 
-        let mut allocator = self.vos.new_object_allocator(self.las.boxed_page_alloc());
-        let (root, data) = allocator.alloc_new(size, Version::new_base())?;
+            f(data)?;
 
-        f(data)?;
-
-        ptr_root.compare_and_swap(UntypedPointer::new_none(), root);
+            ptr_root.compare_and_swap(UntypedPointer::new_none(), root);
+        }
 
         Ok(())
     }

@@ -73,3 +73,9 @@ pub fn crc<T>(anyref: &T) -> u32 {
     hasher.update(bytes);
     hasher.finalize()
 }
+
+pub fn crc_slice(buf: &[u8]) -> u32 {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(buf);
+    hasher.finalize()
+}

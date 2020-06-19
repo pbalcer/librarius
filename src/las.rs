@@ -1,6 +1,6 @@
 use crate::error::{Error, Result};
 use crate::source::{Page, Source, SourceAllocator};
-use crate::utils::{crc, math, unsafe_utils, OptionExt};
+use crate::utils::{crc, crc_slice, math, unsafe_utils, OptionExt};
 use memoffset::offset_of;
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
@@ -92,6 +92,7 @@ struct Meta {
     data: MetaData,
     crc: u32,
     root: [u8; ROOT_SIZE],
+    root_crc: u32,
 }
 
 impl Meta {
@@ -104,6 +105,7 @@ impl Meta {
             data,
             crc,
             root: [0; ROOT_SIZE],
+            root_crc: 0,
         }
     }
 
@@ -195,8 +197,11 @@ impl<'data> LogicalAddressSpace<'data> {
         LogicalSlice::new(offset, len)
     }
 
-    pub fn attach(&mut self, source: impl Source + 'data) -> Result<()> {
-        let allocator = SourceAllocator::new(source, self.pagesize, Self::page_valid)?;
+    pub fn attach<F>(&mut self, source: impl Source + 'data, valid: F) -> Result<()>
+    where
+        F: Fn(&[u8]) -> bool,
+    {
+        let allocator = SourceAllocator::new(source, self.pagesize, |data| valid(data))?;
 
         let metapage = allocator.get_meta()?;
 
@@ -282,9 +287,34 @@ impl<'data> LogicalAddressSpace<'data> {
 
             let metapage = source.get_meta()?;
 
-            Ok(LogicalSlice::new(base_offset + metapage.offset() + offset_of!(Meta, root), ROOT_SIZE))
+            Ok(LogicalSlice::new(
+                base_offset + metapage.offset() + offset_of!(Meta, root),
+                ROOT_SIZE,
+            ))
         })?;
+
         Ok(root_location.clone())
+    }
+
+    pub fn flush_root(&self) -> Result<()> {
+        let root = self.root.read().unwrap();
+        let root_data = self.read(&root)?;
+
+        let (base_offset, source) = self
+            .get_best_persistent()
+            .ok_or(Error::NoAvailableMemory {})?;
+
+        let metapage = source.get_meta()?;
+
+        let mut data = vec![0; self.pagesize];
+        source.read_into(&metapage, 0, &mut data)?;
+        let metap: &mut Meta = unsafe_utils::any_from_slice_mut(data.as_mut_slice());
+        metap.root.copy_from_slice(root_data);
+        metap.root_crc = crc_slice(root_data);
+
+        source.write_from(&metapage, 0, data.as_slice())?;
+
+        Ok(())
     }
 
     pub fn alloc<'tx>(&'tx self) -> Result<LogicalMutRef<'tx>>
@@ -386,13 +416,11 @@ impl<'data> LogicalAddressSpace<'data> {
 mod tests {
     use super::*;
     use crate::source::MemorySource;
-    use std::cell::RefCell;
-    use std::rc::Rc;
 
     #[test]
     fn basic_test() -> Result<()> {
         let mut las = LogicalAddressSpace::new(4096);
-        las.attach(MemorySource::new(1 << 20)?)?;
+        las.attach(MemorySource::new(1 << 20)?, |data| false)?;
 
         let root = las.root_location()?;
 

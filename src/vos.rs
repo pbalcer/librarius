@@ -432,6 +432,11 @@ impl<'data> VersionedObjectStore<'data> {
         VersionedReader::new(*self.version.read(), las)
     }
 
+    pub fn valid_page(data: &[u8]) -> bool {
+        let header = ObjectHeader::from_slice(data);
+        header.size != 0
+    }
+
     pub fn commit_version<F>(
         &self,
         version: &Version,
