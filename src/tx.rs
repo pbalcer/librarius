@@ -91,7 +91,7 @@ impl<'tx, 'data: 'tx> Transaction<'tx, 'data> {
     }
 
     pub fn root(&mut self) -> Result<&'tx UntypedPointer> {
-        let root_location = self.las.root_location()?;
+        let root_location = self.las.root_location();
         let ptr = UntypedPointer::new_byte_addressable(root_location.address());
         let data = self.las.read(&root_location)?;
 

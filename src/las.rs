@@ -169,85 +169,100 @@ const CONTEXT_SIZE: usize = 16;
 pub type PageAlloc<'tx> = Box<dyn Fn() -> Result<LogicalMutRef<'tx>> + 'tx>;
 
 pub struct LogicalAddressSpace<'data> {
-    sources: RwLock<BTreeMap<LogicalAddress, Arc<SourceAllocator<'data>>>>,
+    sources: BTreeMap<LogicalAddress, Arc<SourceAllocator<'data>>>,
     pagesize: usize,
-    root: RwLock<Option<LogicalSlice>>,
+    root: LogicalSlice,
 }
 
 impl<'data> LogicalAddressSpace<'data> {
-    pub fn new(pagesize: usize) -> Self {
-        LogicalAddressSpace {
-            sources: RwLock::new(BTreeMap::new()),
-            pagesize,
-            root: RwLock::new(None),
+    pub fn new<F>(
+        pagesize: usize,
+        raw_sources: impl Iterator<Item = Box<dyn Source + 'data>>,
+        valid: F,
+        create: bool,
+    ) -> Result<Self>
+    where
+        F: Fn(&[u8]) -> bool,
+    {
+        let mut sources = BTreeMap::new();
+        let mut unallocated = Vec::new();
+        let mut root = None;
+
+        for source in raw_sources {
+            let allocator = SourceAllocator::new(source, pagesize, |data| valid(data))?;
+            let metapage = allocator.get_meta()?;
+
+            let mut data = vec![0; pagesize];
+            allocator.read_into(&metapage, 0, &mut data)?;
+            let metap: &mut Meta = unsafe_utils::any_from_slice_mut(data.as_mut_slice());
+            if metap.is_valid() {
+                if metap.root != ROOT_NONE {
+                    if root.is_some() {
+                        return Err(Error::RootExists {});
+                    }
+                    root = Some(LogicalSlice::new(
+                        metap.slice().offset + offset_of!(Meta, root),
+                        ROOT_SIZE,
+                    ));
+                };
+                let start = metap.slice().offset;
+                let end = start + metap.slice().len - 1;
+                if sources.range(start..end).count() != 0 {
+                    /* XXX: this has to check if there isn't any earlier mapping */
+                    return Err(Error::InvalidLogicalAddress {});
+                } else {
+                    sources.insert(start, Arc::new(allocator));
+                }
+            } else {
+                if !create {
+                    return Err(Error::OpenOnUninitialized {});
+                }
+                unallocated.push(allocator);
+            }
         }
+
+        for source in unallocated {
+            let last = sources.iter().next_back();
+            let offset = last.map_or(0, |(offset, allocator)| offset + allocator.length());
+
+            let slice = LogicalSlice::new(offset, source.length());
+
+            let meta = Meta::new(slice);
+            let data = unsafe_utils::any_as_slice(&meta);
+
+            let metapage = source.get_meta()?;
+
+            source.write_from(&metapage, 0, data)?;
+
+            sources.insert(meta.slice().offset, Arc::new(source));
+        }
+
+        let mut las = LogicalAddressSpace {
+            sources,
+            pagesize,
+            root: LogicalSlice::new(0, 0),
+        };
+
+        if root.is_none() {
+            assert!(create);
+
+            let (base_offset, source) = las
+                .get_best_byte_addressable()
+                .ok_or(Error::NoAvailableMemory {})?;
+
+            let metapage = source.get_meta()?;
+            root = Some(LogicalSlice::new(
+                base_offset + metapage.offset() + offset_of!(Meta, root),
+                ROOT_SIZE,
+            ));
+        }
+        las.root = root.unwrap();
+
+        Ok(las)
     }
 
     pub fn boxed_page_alloc<'tx>(&'tx self) -> PageAlloc<'tx> {
         Box::new(move || self.alloc())
-    }
-
-    fn allocate_address_space(&mut self, len: usize) -> LogicalSlice {
-        let sources = self.sources.write();
-
-        let last = sources.iter().next_back();
-
-        let offset = last.map_or(0, |(offset, allocator)| offset + allocator.length());
-
-        LogicalSlice::new(offset, len)
-    }
-
-    pub fn attach<F>(&mut self, source: impl Source + 'data, valid: F) -> Result<()>
-    where
-        F: Fn(&[u8]) -> bool,
-    {
-        let allocator = SourceAllocator::new(source, self.pagesize, |data| valid(data))?;
-
-        let metapage = allocator.get_meta()?;
-
-        let (slice, root) = {
-            let mut data = vec![0; self.pagesize];
-            allocator.read_into(&metapage, 0, &mut data)?;
-            let metap: &mut Meta = unsafe_utils::any_from_slice_mut(data.as_mut_slice());
-            if metap.is_valid() {
-                let root = if metap.root == ROOT_NONE {
-                    None
-                } else {
-                    Some(metap.root)
-                };
-                (metap.slice().clone(), root)
-            } else {
-                let meta = Meta::new(self.allocate_address_space(allocator.length()));
-                let data = unsafe_utils::any_as_slice(&meta);
-
-                allocator.write_from(&metapage, 0, data)?;
-
-                (meta.slice().clone(), None)
-            }
-        };
-
-        if let Some(root) = root {
-            let mut root_location = self.root.write();
-            if root_location.is_some() {
-                return Err(Error::RootExists {});
-            }
-
-            *root_location = Some(LogicalSlice::new(
-                slice.offset + offset_of!(Meta, root),
-                ROOT_SIZE,
-            ));
-        }
-
-        let mut sources = self.sources.write();
-        let start = slice.offset;
-        let end = start + slice.len - 1;
-        if sources.range(start..end).count() != 0 {
-            /* XXX: this has to check if there isn't any earlier mapping */
-            Err(Error::InvalidLogicalAddress {})
-        } else {
-            sources.insert(start, Arc::new(allocator));
-            Ok(())
-        }
     }
 
     fn page_valid(bytes: &[u8]) -> bool {
@@ -259,7 +274,6 @@ impl<'data> LogicalAddressSpace<'data> {
         F: Fn(&Arc<SourceAllocator>) -> bool,
     {
         self.sources
-            .read()
             .iter()
             .find(|(_, s)| f(s))
             .map(|(base_offset, source)| (*base_offset, source.clone()))
@@ -273,31 +287,13 @@ impl<'data> LogicalAddressSpace<'data> {
         self.get_best_source(|s| s.is_byte_addressable())
     }
 
-    pub fn root_location(&self) -> Result<LogicalSlice> {
-        if let Some(root_location) = self.root.read().as_ref() {
-            return Ok(root_location.clone());
-        }
-
-        let mut root = self.root.write();
-
-        let root_location = root.get_or_insert_with_result(|| {
-            let (base_offset, source) = self
-                .get_best_byte_addressable()
-                .ok_or(Error::NoAvailableMemory {})?;
-
-            let metapage = source.get_meta()?;
-
-            Ok(LogicalSlice::new(
-                base_offset + metapage.offset() + offset_of!(Meta, root),
-                ROOT_SIZE,
-            ))
-        })?;
-
-        Ok(root_location.clone())
+    pub fn root_location(&self) -> LogicalSlice {
+        self.root
     }
 
     pub fn flush_root(&self) -> Result<()> {
-        let root = self.root.read().unwrap();
+        todo!()
+        /*let root = self.root.read().unwrap();
         let root_data = self.read(&root)?;
 
         let (base_offset, source) = self
@@ -314,7 +310,7 @@ impl<'data> LogicalAddressSpace<'data> {
 
         source.write_from(&metapage, 0, data.as_slice())?;
 
-        Ok(())
+        Ok(())*/
     }
 
     pub fn alloc<'tx>(&'tx self) -> Result<LogicalMutRef<'tx>>
@@ -348,9 +344,8 @@ impl<'data> LogicalAddressSpace<'data> {
     where
         F: FnOnce(usize, Arc<SourceAllocator<'data>>) -> Result<R>,
     {
-        let sources = self.sources.read();
-
-        let (base_offset, source) = sources
+        let (base_offset, source) = self
+            .sources
             .range((Included(&0), Included(&slice.offset)))
             .next_back()
             .ok_or(Error::InvalidLogicalAddress {})?;
@@ -416,13 +411,14 @@ impl<'data> LogicalAddressSpace<'data> {
 mod tests {
     use super::*;
     use crate::source::MemorySource;
+    use std::iter;
 
     #[test]
     fn basic_test() -> Result<()> {
-        let mut las = LogicalAddressSpace::new(4096);
-        las.attach(MemorySource::new(1 << 20)?, |data| false)?;
+        let source: Box<dyn Source> = Box::new(MemorySource::new(1 << 20)?);
+        let las = LogicalAddressSpace::new(4096, iter::once(source), |data| false, true)?;
 
-        let root = las.root_location()?;
+        let root = las.root_location();
 
         let slice = las.read(&root)?;
 

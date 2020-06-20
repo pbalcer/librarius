@@ -1,4 +1,4 @@
-use librarius::{Librarius, Result, MemorySource, FileSource};
+use librarius::{FileSource, Librarius, LibrariusBuilder, MemorySource, Result};
 
 use std::env;
 
@@ -7,15 +7,14 @@ fn main() -> Result<()> {
         .nth(1)
         .expect("no database source file specified");
 
-    let mut librarius = Librarius::new(4096);
-
-    librarius.attach(MemorySource::new(1 << 20)?)?;
-    librarius.attach(FileSource::new(file.as_str(), 1 << 20)?)?;
-
-    librarius.root_alloc_if_none(1024, |buf| {
-        buf[1] = 5;
-        Ok(())
-    })?;
+    let librarius = LibrariusBuilder::new()
+        .create_with(1024, |data| {
+            data[1] = 5;
+            Ok(())
+        })
+        .source(MemorySource::new(1 << 20)?)
+        .source(FileSource::new(file.as_str(), 1 << 20)?)
+        .open()?;
 
     let value = librarius.run(|tx| {
         let root = tx.root()?;

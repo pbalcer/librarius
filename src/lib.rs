@@ -10,9 +10,9 @@ mod typed;
 mod utils;
 mod vos;
 
-pub use crate::librarius::Librarius;
+pub use crate::librarius::{Librarius, LibrariusBuilder};
 pub use error::{Error, Result};
 pub use source::{FileSource, MemorySource, Source};
 pub use tx::Transaction;
-pub use typed::{Persistent, TypedLibrarius, TypedTransaction};
+pub use typed::{Persistent, TypedLibrariusBuilder, TypedTransaction};
 pub use vos::UntypedPointer;

@@ -5,30 +5,80 @@ use crate::tx::Transaction;
 use crate::utils::unsafe_utils;
 use crate::vos::{UntypedPointer, Version, VersionedObjectStore};
 
+pub struct LibrariusBuilder<'data, 'root> {
+    sources: Vec<Box<dyn Source + 'data>>,
+    pagesize: usize,
+    root: Option<(usize, Box<dyn Fn(&mut [u8]) -> Result<()> + 'root>)>,
+}
+
+impl<'data, 'root> LibrariusBuilder<'data, 'root> {
+    pub fn new() -> Self {
+        LibrariusBuilder {
+            sources: Vec::new(),
+            pagesize: 4096,
+            root: None,
+        }
+    }
+
+    pub fn create_with(
+        mut self,
+        root_size: usize,
+        f: impl Fn(&mut [u8]) -> Result<()> + 'root,
+    ) -> Self {
+        self.root = Some((root_size, Box::new(f)));
+        self
+    }
+
+    pub fn source(mut self, source: impl Source + 'data) -> Self {
+        self.sources.push(Box::new(source));
+        self
+    }
+
+    pub fn pagesize(mut self, pagesize: usize) -> Self {
+        self.pagesize = pagesize;
+        self
+    }
+
+    pub fn open(self) -> Result<Librarius<'data>> {
+        Librarius::new(self.pagesize, self.sources.into_iter(), self.root)
+    }
+}
+
 pub struct Librarius<'data> {
     las: LogicalAddressSpace<'data>,
     vos: VersionedObjectStore<'data>,
 }
 
 impl<'data> Librarius<'data> {
-    pub fn new(pagesize: usize) -> Librarius<'data> {
-        let las = LogicalAddressSpace::new(pagesize);
-        let vos = VersionedObjectStore::new();
-        Librarius { las, vos }
-    }
-
-    pub fn attach(&mut self, source: impl Source + 'data) -> Result<()> {
-        self.las
-            .attach(source, |data| VersionedObjectStore::valid_page(data))?;
-
-        Ok(())
-    }
-
-    pub fn root_alloc_if_none<F>(&mut self, size: usize, f: F) -> Result<()>
+    pub fn new<F>(
+        pagesize: usize,
+        sources: impl Iterator<Item = Box<dyn Source + 'data>>,
+        root: Option<(usize, F)>,
+    ) -> Result<Librarius<'data>>
     where
         F: Fn(&mut [u8]) -> Result<()>,
     {
-        let root_location = self.las.root_location()?;
+        let las = LogicalAddressSpace::new(
+            pagesize,
+            sources,
+            VersionedObjectStore::valid_page,
+            root.is_some(),
+        )?;
+        let vos = VersionedObjectStore::new();
+        let mut librarius = Librarius { las, vos };
+
+        if let Some((root_size, root_constr)) = root {
+            librarius.root_alloc(root_size, root_constr)?;
+        }
+
+        Ok(librarius)
+    }
+
+    fn root_alloc<F>(&mut self, size: usize, f: F) -> Result<()>
+    where
+        F: Fn(&mut [u8]) -> Result<()>,
+    {
+        let root_location = self.las.root_location();
         let ptr_location = UntypedPointer::new_byte_addressable(root_location.address());
 
         let data = self.las.read(&root_location)?;
@@ -82,18 +132,19 @@ mod tests {
 
     #[test]
     fn counter() -> Result<()> {
-        let mut librarius = Librarius::new(4096);
-        librarius.attach(MemorySource::new(1 << 20)?)?;
-
         let root_size = std::mem::size_of::<usize>();
+
+        let librarius = LibrariusBuilder::new()
+            .create_with(root_size, |data| {
+                let counter: &mut usize = unsafe_utils::any_from_slice_mut(data);
+                *counter = 0;
+
+                Ok(())
+            })
+            .source(MemorySource::new(1 << 20)?)
+            .open()?;
+
         let nthreads = 10;
-
-        librarius.root_alloc_if_none(root_size, |data| {
-            let counter: &mut usize = unsafe_utils::any_from_slice_mut(data);
-            *counter = 0;
-
-            Ok(())
-        })?;
 
         let librarius = Arc::new(librarius);
 
@@ -133,7 +184,7 @@ mod tests {
         Ok(())
     }
 
-    use crate::typed::{Persistent, PersistentPointer, TypedLibrarius, TypedTransaction};
+    use crate::typed::{Persistent, PersistentPointer, TypedLibrariusBuilder, TypedTransaction};
 
     struct Tuple {
         value: bool,
@@ -173,10 +224,10 @@ mod tests {
 
     #[test]
     fn switcharoo() -> Result<()> {
-        let mut librarius = Librarius::new(4096);
-        librarius.attach(MemorySource::new(1 << 30)?)?;
-
-        librarius.root_typed_alloc_if_none(|| Root::new())?;
+        let librarius = LibrariusBuilder::new()
+            .create_with_typed(|| Root::new())
+            .source(MemorySource::new(1 << 20)?)
+            .open()?;
         let nthreads = 10;
 
         librarius.run_repeatedly(|tx| {

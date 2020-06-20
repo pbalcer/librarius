@@ -1,8 +1,8 @@
 use crate::utils::unsafe_utils;
 use crate::vos::UntypedPointer;
-use crate::Librarius;
 use crate::Result;
 use crate::Transaction;
+use crate::{Librarius, LibrariusBuilder};
 use std::marker::PhantomData;
 use std::mem::size_of;
 
@@ -39,20 +39,20 @@ impl<T: Persistent> PersistentPointer<T> {
     }
 }
 
-pub trait TypedLibrarius {
-    fn root_typed_alloc_if_none<T: Persistent, F>(&mut self, f: F) -> Result<()>
+pub trait TypedLibrariusBuilder<'root> {
+    fn create_with_typed<T: Persistent, TC>(self, f: TC) -> Self
     where
-        F: Fn() -> T;
+        TC: Fn() -> T + 'root;
 }
 
-impl<'data> TypedLibrarius for Librarius<'data> {
-    fn root_typed_alloc_if_none<T: Persistent, F>(&mut self, f: F) -> Result<()>
+impl<'data, 'root> TypedLibrariusBuilder<'root> for LibrariusBuilder<'data, 'root> {
+    fn create_with_typed<T: Persistent, TC>(self, tc: TC) -> Self
     where
-        F: Fn() -> T,
+        TC: Fn() -> T + 'root,
     {
-        self.root_alloc_if_none(size_of::<T>(), |data| {
+        self.create_with(size_of::<T>(), move |data| {
             let typed = unsafe_utils::any_from_slice_mut(data);
-            *typed = f();
+            *typed = tc();
             Ok(())
         })
     }

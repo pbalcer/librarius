@@ -42,6 +42,9 @@ pub enum Error {
     #[snafu(display("source with root already exists"))]
     RootExists {},
 
+    #[snafu(display("tried to open an uninitialized source"))]
+    OpenOnUninitialized {},
+
     #[snafu(display("tried to create a log entry larger than a pagesize"))]
     LogEntryTooLarge {},
 
