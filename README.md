@@ -124,14 +124,16 @@ Background information and glossary in [14].
         idx: Index<usize, MyData>
     };
 
-    let storage = Storage::new()?;
-    storage.attach(MemorySource::new(1 << 40))?;
-    storage.attach(PMEMSource::new("/mnt/pmem/file"))?;
-    storage.attach(SDPKSource::new("/dev/something"))?;
-    storage.attach(IOUringSource::new("/mnt/ssd/file"))?;
-    storage.attach(RpmaSource::new("..."))?;
+    let librarius = LibrariusBuilder::new()
+        .create_with_typed(|| Root::new())
+        .source(MemorySource::new(1 << 40)?)
+        .source(PMEMSource::new("/mnt/pmem/file")?)
+        .source(SDPKSource::new("/dev/something")?)
+        .source(IOUringSource::new("/mnt/ssd/file")?)
+        .source(RpmaSource::new("...")?)
+        .open()?;
 
-    let subscription = storage.subscribe(|snapshot| {
+    let subscription = librarius.subscribe(|snapshot| {
         let mut root = snapshot.root::<MyRoot>()?;
         let rootref = snapshot.read(root)?;
 
@@ -145,7 +147,7 @@ Background information and glossary in [14].
         }
     });
 
-    storage.run(|tx| {
+    librarius.run(|tx| {
         let mut root = tx.root::<MyRoot>()?;
 
         let rootref = tx.read(root)?;
@@ -179,21 +181,21 @@ Background information and glossary in [14].
         bar: usize,
     }
 
-    let storage = Storage::new()?;
+    let librarius = ...;
     ...
 
     /*
      * This will be called lazily by a transaction once it encounters an older
      * version of an object.
      */
-    storage.register_upgrade(|tx, data: &MyData_v1| {
+    librarius.register_upgrade(|tx, data: &MyData_v1| {
         MyData_v2 {
             foo: data.foo,
             bar: 0,
         }
     });
 
-    storage.run(|tx| {
+    librarius.run(|tx| {
         ...
 
         /* the object is guaranteed to be in the new version */
