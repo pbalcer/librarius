@@ -79,3 +79,14 @@ pub fn crc_slice(buf: &[u8]) -> u32 {
     hasher.update(buf);
     hasher.finalize()
 }
+
+#[macro_export]
+macro_rules! is_enum_variant {
+    ($v:expr, $p:pat) => {
+        if let $p = $v {
+            true
+        } else {
+            false
+        }
+    };
+}

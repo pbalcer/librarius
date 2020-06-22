@@ -1,9 +1,9 @@
 use crate::error::{Error, Result};
-use crate::las::{LogicalAddress, LogicalAddressSpace};
+use crate::las::{LogicalAddress, LogicalAddressSpace, StoredLogicalSlice};
 use crate::utils::unsafe_utils;
 use crate::vos::{
     TransactionalLogAllocator, TransactionalObjectAllocator, UntypedPointer, Version,
-    VersionedObjectStore, VersionedReader,
+    VersionedObjectStore, VersionedReader, ObjectSize
 };
 
 struct TransactionWrite<'tx> {
@@ -19,7 +19,7 @@ impl<'tx> TransactionWrite<'tx> {
 
     pub fn perform(&self) -> bool {
         self.dst.compare_and_swap(
-            UntypedPointer::new_byte_addressable(self.current),
+            UntypedPointer::new_byte(self.current),
             self.new.clone(),
         )
     }
@@ -27,7 +27,7 @@ impl<'tx> TransactionWrite<'tx> {
     pub fn rollback(&self) {
         let success = self.dst.compare_and_swap(
             self.new.clone(),
-            UntypedPointer::new_byte_addressable(self.current),
+            UntypedPointer::new_byte(self.current),
         );
         assert!(success)
     }
@@ -46,6 +46,7 @@ impl<'tx> TransactionRead<'tx> {
 pub struct Transaction<'tx, 'data: 'tx> {
     las: &'tx LogicalAddressSpace<'data>,
     vos: &'tx VersionedObjectStore<'data>,
+    root: &'tx UntypedPointer,
 
     object_allocator: TransactionalObjectAllocator<'tx>,
     log_allocator: TransactionalLogAllocator<'tx>,
@@ -60,6 +61,7 @@ impl<'tx, 'data: 'tx> Transaction<'tx, 'data> {
     pub fn new(
         las: &'tx LogicalAddressSpace<'data>,
         vos: &'tx VersionedObjectStore<'data>,
+        root: &'tx UntypedPointer,
     ) -> Self {
         let object_allocator = vos.new_object_allocator(las.boxed_page_alloc());
         let log_allocator = vos.new_log_allocator(las.boxed_page_alloc());
@@ -68,6 +70,7 @@ impl<'tx, 'data: 'tx> Transaction<'tx, 'data> {
         Transaction {
             vos,
             las,
+            root,
             object_allocator,
             log_allocator,
             reader,
@@ -77,37 +80,31 @@ impl<'tx, 'data: 'tx> Transaction<'tx, 'data> {
         }
     }
 
-    pub fn read(&mut self, pointer: &'tx UntypedPointer, size: usize) -> Result<&'tx [u8]> {
-        self.reader.read(pointer, size, false)
+    pub fn read(&mut self, pointer: &'tx UntypedPointer, size: &ObjectSize) -> Result<&'tx [u8]> {
+        Ok(self.reader.read(pointer, size, false)?.0)
     }
 
     pub fn read_for_write(
         &mut self,
         pointer: &'tx UntypedPointer,
-        size: usize,
+        size: &ObjectSize,
     ) -> Result<&'tx [u8]> {
         self.readset.push(TransactionRead::new(pointer));
-        self.reader.read(pointer, size, true)
+        Ok(self.reader.read(pointer, size, true)?.0)
     }
 
-    pub fn root(&mut self) -> Result<&'tx UntypedPointer> {
-        let root_location = self.las.root_location();
-        let ptr = UntypedPointer::new_byte_addressable(root_location.address());
-        let data = self.las.read(&root_location)?;
-
-        let root: &UntypedPointer = unsafe_utils::any_from_slice(data);
-
-        Ok(root)
+    pub fn root(&mut self) -> &'tx UntypedPointer {
+        self.root
     }
 
-    pub fn write(&mut self, pointer: &'tx UntypedPointer, size: usize) -> Result<&'tx mut [u8]> {
+    pub fn write(&mut self, pointer: &'tx UntypedPointer, size: &ObjectSize) -> Result<&'tx mut [u8]> {
         let read_pointer = pointer.clone();
         let address = read_pointer.address();
 
         let version = self.write_version()?;
 
-        let src = self.reader.read(&read_pointer, size, true)?;
-        let (dstptr, dst) = self.object_allocator.alloc(size, version, read_pointer)?;
+        let (src, hdr) = self.reader.read(&read_pointer, size, true)?;
+        let (dstptr, dst) = self.object_allocator.alloc(*size, version, read_pointer)?;
 
         dst.copy_from_slice(src);
 
@@ -131,7 +128,7 @@ impl<'tx, 'data: 'tx> Transaction<'tx, 'data> {
         }
     }
 
-    pub fn alloc(&mut self, size: usize) -> Result<(UntypedPointer, &'tx mut [u8])> {
+    pub fn alloc(&mut self, size: ObjectSize) -> Result<(UntypedPointer, &'tx mut [u8])> {
         let version = self.write_version()?;
         self.object_allocator.alloc_new(size, version)
     }
@@ -152,7 +149,10 @@ impl<'tx, 'data: 'tx> Transaction<'tx, 'data> {
                 .vos
                 .commit_version(version, self.las, || {
                     for read in &self.readset {
-                        self.reader.read(read.pointer, 0, true)?;
+                        let other = self.reader.read_version(read.pointer)?;
+                        if other.newer(version, self.las)? {
+                            return Err(Error::TxAborted {});
+                        }
                     }
                     Ok(())
                 })

@@ -1,14 +1,20 @@
 use crate::utils::unsafe_utils;
-use crate::vos::UntypedPointer;
+use crate::vos::{ObjectSize, UntypedPointer};
 use crate::Result;
 use crate::Transaction;
 use crate::{Librarius, LibrariusBuilder};
 use std::marker::PhantomData;
 use std::mem::size_of;
 
-pub trait Persistent {}
+pub trait Persistent {
+    fn size() -> ObjectSize;
+}
 
-impl Persistent for UntypedPointer {}
+impl Persistent for UntypedPointer {
+    fn size() -> ObjectSize {
+        ObjectSize::new_with_usize(size_of::<UntypedPointer>(), 0)
+    }
+}
 
 pub struct PersistentPointer<T: Persistent> {
     raw: UntypedPointer,
@@ -50,7 +56,7 @@ impl<'data, 'root> TypedLibrariusBuilder<'root> for LibrariusBuilder<'data, 'roo
     where
         TC: Fn() -> T + 'root,
     {
-        self.create_with(size_of::<T>(), move |data| {
+        self.create_with(T::size(), move |data| {
             let typed = unsafe_utils::any_from_slice_mut(data);
             *typed = tc();
             Ok(())
@@ -64,7 +70,7 @@ pub trait TypedTransaction<'tx> {
         pointer: &'tx PersistentPointer<T>,
     ) -> Result<&'tx mut T>;
     fn read_typed<T: Persistent>(&mut self, pointer: &'tx PersistentPointer<T>) -> Result<&'tx T>;
-    fn root_typed<T: Persistent>(&mut self) -> Result<&'tx PersistentPointer<T>>;
+    fn root_typed<T: Persistent>(&mut self) -> &'tx PersistentPointer<T>;
     fn alloc_typed<T: Persistent, F>(&mut self, f: F) -> Result<PersistentPointer<T>>
     where
         F: Fn() -> T;
@@ -75,25 +81,25 @@ impl<'tx, 'data> TypedTransaction<'tx> for Transaction<'tx, 'data> {
         &mut self,
         pointer: &'tx PersistentPointer<T>,
     ) -> Result<&'tx mut T> {
-        let data = self.write(pointer.as_raw(), size_of::<T>())?;
+        let data = self.write(pointer.as_raw(), &T::size())?;
         Ok(unsafe_utils::any_from_slice_mut(data))
     }
 
     fn read_typed<T: Persistent>(&mut self, pointer: &'tx PersistentPointer<T>) -> Result<&'tx T> {
-        let data = self.read(pointer.as_raw(), size_of::<T>())?;
+        let data = self.read(pointer.as_raw(), &T::size())?;
         Ok(unsafe_utils::any_from_slice(data))
     }
 
-    fn root_typed<T: Persistent>(&mut self) -> Result<&'tx PersistentPointer<T>> {
-        let raw = self.root()?;
-        Ok(PersistentPointer::from_raw_ref(raw))
+    fn root_typed<T: Persistent>(&mut self) -> &'tx PersistentPointer<T> {
+        let raw = self.root();
+        PersistentPointer::from_raw_ref(raw)
     }
 
     fn alloc_typed<T: Persistent, F>(&mut self, f: F) -> Result<PersistentPointer<T>>
     where
         F: Fn() -> T,
     {
-        let (raw, data) = self.alloc(size_of::<T>())?;
+        let (raw, data) = self.alloc(T::size())?;
 
         let data = unsafe_utils::any_from_slice_mut(data);
         *data = f();

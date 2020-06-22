@@ -1,6 +1,9 @@
 use crate::error::{Error, Result};
-use crate::las::{LogicalAddress, LogicalAddressSpace, LogicalMutRef, LogicalSlice, PageAlloc};
-use crate::utils::unsafe_utils;
+use crate::las::{
+    BlockLogicalSlice, ByteLogicalSlice, LogicalAddress, LogicalAddressSpace, LogicalMutRef,
+    LogicalSlice, PageAlloc, StoredLogicalSlice,
+};
+use crate::utils::{unsafe_utils, OptionExt};
 use parking_lot::RwLock;
 use std::marker::PhantomData;
 use std::mem::size_of;
@@ -39,17 +42,42 @@ impl UntypedPointer {
         }
     }
 
-    pub(crate) fn new_byte_addressable(address: LogicalAddress) -> Self {
+    fn internal_clone(&self) -> Self {
+        UntypedPointer {
+            address: AtomicUsize::new(self.address_internal()),
+        }
+    }
+
+    pub(crate) fn new_from_block(slice: &BlockLogicalSlice) -> Self {
+        Self::new_block(slice.0.address())
+    }
+
+    pub(crate) fn new_from_byte(slice: &ByteLogicalSlice) -> Self {
+        Self::new_byte(slice.0.address())
+    }
+
+    pub(crate) fn new_from_stored(slice: &StoredLogicalSlice) -> Self {
+        match slice {
+            StoredLogicalSlice::Block(slice) => Self::new_from_block(slice),
+            StoredLogicalSlice::Byte(slice) => Self::new_from_byte(slice),
+        }
+    }
+
+    pub(crate) fn new_byte(address: LogicalAddress) -> Self {
         UntypedPointer {
             address: AtomicUsize::new(address | Self::POINTER_BYTE_ADDRESSABLE),
         }
     }
 
-    pub(crate) fn is_some(&self) -> bool {
+    pub fn is_some(&self) -> bool {
         self.address() != 0
     }
 
-    fn new_storage(address: LogicalAddress) -> Self {
+    pub fn is_none(&self) -> bool {
+        self.address() == 0
+    }
+
+    fn new_block(address: LogicalAddress) -> Self {
         UntypedPointer {
             address: AtomicUsize::new(address | Self::POINTER_BLOCK),
         }
@@ -81,6 +109,16 @@ impl UntypedPointer {
 
     pub(crate) fn address(&self) -> LogicalAddress {
         self.address_internal() & Self::POINTER_ADDRESS_MASK
+    }
+
+    fn into_stored_slice(&self, len: usize) -> StoredLogicalSlice {
+        let slice = LogicalSlice::new(self.address(), len);
+        StoredLogicalSlice::new(slice, self.is_byte_addressable())
+    }
+
+    fn into_stored_slice_offset(&self, len: usize, offset: usize) -> StoredLogicalSlice {
+        let slice = LogicalSlice::new(self.address() - offset, len + offset);
+        StoredLogicalSlice::new(slice, self.is_byte_addressable())
     }
 
     pub fn refcount(&self) -> &AtomicU8 {
@@ -135,8 +173,11 @@ impl Version {
     }
 
     fn type_bytes(&self) -> usize {
-        let version = self.version.load(Ordering::SeqCst);
-        version & Self::VERSION_TYPE_MASK
+        self.version.load(Ordering::SeqCst) & Self::VERSION_TYPE_MASK
+    }
+
+    fn data_bytes(&self) -> usize {
+        self.version.load(Ordering::SeqCst) & Self::VERSION_DATA_MASK
     }
 
     fn commit(&self, new_version: usize, las: &LogicalAddressSpace) -> Result<()> {
@@ -146,11 +187,12 @@ impl Version {
 
             Ok(())
         } else {
-            let data = self.version.load(Ordering::SeqCst) & Self::VERSION_DATA_MASK;
-
+            let data = self.data_bytes();
             let ptr = UntypedPointer::from_raw(data);
-            let slice = LogicalSlice::new(ptr.address(), size_of::<Version>());
-            let data = las.read(&slice)?;
+
+            let slice = ptr.into_stored_slice(size_of::<Version>());
+
+            let data = las.read(&slice.unwrap_byte())?;
 
             let real_version = unsafe_utils::any_from_slice::<Version>(data);
 
@@ -168,15 +210,21 @@ impl Version {
         }
     }
 
+    pub fn newer(&self, other: &Version, las: &LogicalAddressSpace) -> Result<bool> {
+        let s = self.read(las)?;
+        let o = other.read(las)?;
+        Ok(s > o)
+    }
+
     fn read(&self, las: &LogicalAddressSpace) -> Result<usize> {
-        let data = self.version.load(Ordering::SeqCst) & Self::VERSION_DATA_MASK;
+        let data = self.data_bytes();
 
         if self.type_bytes() == Self::VERSION_TYPE_DIRECT {
             Ok(data)
         } else {
             let ptr = UntypedPointer::from_raw(data);
-            let slice = LogicalSlice::new(ptr.address(), size_of::<Version>());
-            let data = las.read(&slice)?;
+            let slice = ptr.into_stored_slice(size_of::<Version>());
+            let data = las.read(&slice.unwrap_byte())?;
 
             let real_version = unsafe_utils::any_from_slice::<Version>(data);
 
@@ -211,7 +259,7 @@ impl<'tx> GenericAllocator<'tx> {
                 Some(it) => break it,
                 _ => {
                     if page_full {
-                        return Err(Error::LogEntryTooLarge {});
+                        return Err(Error::AllocationTooLarge {});
                     }
                     self.active = None;
                     continue;
@@ -221,15 +269,39 @@ impl<'tx> GenericAllocator<'tx> {
     }
 }
 
-struct ObjectHeader {
-    size: usize,
+#[derive(Copy, Clone, Debug)]
+pub struct ObjectSize {
+    pub pointers: u32,
+    pub data: u32,
+}
+
+impl ObjectSize {
+    pub fn new(pointers: u32, data: u32) -> Self {
+        ObjectSize { pointers, data }
+    }
+
+    pub fn new_with_usize(pointers: usize, data: usize) -> Self {
+        /* XXX: proper conversions... */
+        ObjectSize {
+            pointers: pointers as u32,
+            data: data as u32,
+        }
+    }
+
+    pub fn total(&self) -> usize {
+        (self.pointers + self.data) as usize
+    }
+}
+
+pub struct ObjectHeader {
+    pub size: ObjectSize,
     version: Version,
     parent: UntypedPointer,
     other: UntypedPointer,
 }
 
 impl ObjectHeader {
-    pub fn new(size: usize, version: Version, other: UntypedPointer) -> Self {
+    fn new(size: ObjectSize, version: Version, other: UntypedPointer) -> Self {
         ObjectHeader {
             size,
             version,
@@ -260,32 +332,43 @@ impl<'tx> TransactionalObjectAllocator<'tx> {
 
     pub fn alloc_new(
         &mut self,
-        size: usize,
+        size: ObjectSize,
         version: Version,
     ) -> Result<(UntypedPointer, &'tx mut [u8])> {
         self.alloc(size, version, UntypedPointer::new_none())
     }
 
-    pub fn alloc(
+    pub fn init_object(
         &mut self,
-        size: usize,
+        data: &'tx mut [u8],
+        size: ObjectSize,
         version: Version,
         other: UntypedPointer,
-    ) -> Result<(UntypedPointer, &'tx mut [u8])> {
-        let (slice, data) = self.generic.alloc(size + size_of::<ObjectHeader>())?;
-
+    ) -> &'tx mut [u8] {
         let (hdr, userdata) = data.split_at_mut(size_of::<ObjectHeader>());
 
         let hdrp = ObjectHeader::from_slice_mut(hdr);
 
         *hdrp = ObjectHeader::new(size, version, other);
 
+        userdata
+    }
+
+    pub fn alloc(
+        &mut self,
+        size: ObjectSize,
+        version: Version,
+        other: UntypedPointer,
+    ) -> Result<(UntypedPointer, &'tx mut [u8])> {
+        let (slice, data) = self
+            .generic
+            .alloc(size.total() + size_of::<ObjectHeader>())?;
+
+        let userdata = self.init_object(data, size, version, other);
+
         let (_, userslice) = slice.split_at(size_of::<ObjectHeader>());
 
-        Ok((
-            UntypedPointer::new_byte_addressable(userslice.address()),
-            userdata,
-        ))
+        Ok((UntypedPointer::new_byte(userslice.address()), userdata))
     }
 }
 
@@ -328,25 +411,9 @@ impl<'tx> TransactionalLogAllocator<'tx> {
         let versionp = unsafe_utils::any_from_slice_mut::<Version>(data);
         *versionp = Version::new();
 
-        let ptr = UntypedPointer::new_byte_addressable(slice.address());
+        let ptr = UntypedPointer::new_byte(slice.address());
 
         Ok(Version::new_indirect(ptr))
-    }
-
-    pub fn copy(&mut self, dest: &'tx [u8], src: &[u8]) -> Result<LogicalSlice> {
-        todo!()
-
-        /*        let (slice, data) = self
-                .generic
-                .alloc(src.len() + size_of::<LogEntryHeader>())?;
-
-            let (hdrp, logdata) = data.split_at_mut(size_of::<LogEntryHeader>());
-            let hdr = LogEntryHeader::from_slice_mut(hdrp);
-            *hdr = LogEntryHeader::new(dest);
-            logdata.copy_from_slice(src);
-
-            Ok(slice)
-        */
     }
 }
 
@@ -365,20 +432,82 @@ impl<'tx, 'data> VersionedReader<'tx, 'data> {
         }
     }
 
+    pub fn read_version(&self, ptr: &UntypedPointer) -> Result<&Version> {
+        let slice = ptr.into_stored_slice_offset(0, size_of::<ObjectHeader>());
+        if let StoredLogicalSlice::Block(block) = slice {
+            todo!()
+        }
+
+        let slice = slice.unwrap_byte();
+
+        let hdr = self.las.read(&slice)?;
+
+        let hdrp = ObjectHeader::from_slice(hdr);
+
+        Ok(&hdrp.version)
+    }
+
+    pub fn flush(&self, ptr: &UntypedPointer) -> Result<()> {
+        let slice = ptr.into_stored_slice_offset(0, size_of::<ObjectHeader>());
+        if let StoredLogicalSlice::Block(block) = slice {
+            return Ok(());
+        }
+
+        let slice = slice.unwrap_byte();
+
+        let hdr = self.las.read(&slice)?;
+
+        let hdrp = ObjectHeader::from_slice(hdr);
+        let npointers = hdrp.size.pointers as usize / size_of::<UntypedPointer>();
+
+        let slice = ptr
+            .into_stored_slice(hdrp.size.pointers as usize)
+            .unwrap_byte();
+
+        let data = self.las.read(&slice)?.as_ptr() as *const UntypedPointer;
+        let pointers: &[UntypedPointer] = unsafe { std::slice::from_raw_parts(data, npointers) };
+
+        for p in pointers.iter().filter(|p| p.is_some()) {
+            let oldptr = p.internal_clone();
+            if p.is_byte_addressable() {
+                let stored_slice = p.into_stored_slice(1).unwrap_byte();
+                let mut backing = self.las.get_backing(&stored_slice)?;
+                let backing = backing.get_or_insert_with_result(|| {
+                    self.las.flush(&stored_slice)?;
+                    Ok(self.las.get_backing(&stored_slice)?.unwrap())
+                })?;
+                let newptr = UntypedPointer::new_from_stored(backing);
+                if !p.compare_and_swap(oldptr, newptr) { /* XXX: leaking memory... */ }
+            }
+        }
+
+        self.las.flush(&slice)?;
+
+        Ok(())
+    }
+
     pub fn read(
         &self,
-        pointer: &UntypedPointer,
-        len: usize,
+        ptr: &UntypedPointer,
+        size: &ObjectSize,
         abort_on_conflict: bool,
-    ) -> Result<&'tx [u8]> {
-        if !pointer.is_some() {
+    ) -> Result<(&'tx [u8], &ObjectHeader)> {
+        if !ptr.is_some() {
             return Err(Error::InvalidLogicalAddress {});
         }
 
-        let real_offset = pointer.address() - size_of::<ObjectHeader>();
-        let real_len = len + size_of::<ObjectHeader>();
+        let oldptr = ptr.internal_clone();
+        let slice = oldptr.into_stored_slice_offset(size.total(), size_of::<ObjectHeader>());
+        if let StoredLogicalSlice::Block(block) = slice {
+            let slice = oldptr.into_stored_slice(size.total());
 
-        let slice = LogicalSlice::new(real_offset, real_len);
+            let bytes = self.las.fetch(&slice)?;
+            let newptr = UntypedPointer::new_from_byte(&bytes);
+            if !ptr.compare_and_swap(oldptr, newptr) { /* XXX: leaking memory... */ }
+            return self.read(ptr, size, abort_on_conflict);
+        }
+
+        let slice = slice.unwrap_byte();
 
         let data = self.las.read(&slice)?;
 
@@ -390,10 +519,10 @@ impl<'tx, 'data> VersionedReader<'tx, 'data> {
             if abort_on_conflict {
                 Err(Error::TxAborted {})
             } else {
-                self.read(&hdrp.other, len, abort_on_conflict)
+                self.read(&hdrp.other, size, abort_on_conflict)
             }
         } else {
-            Ok(userdata)
+            Ok((userdata, hdrp))
         }
     }
 }
@@ -434,7 +563,7 @@ impl<'data> VersionedObjectStore<'data> {
 
     pub fn valid_page(data: &[u8]) -> bool {
         let header = ObjectHeader::from_slice(data);
-        header.size != 0
+        header.size.total() != 0
     }
 
     pub fn commit_version<F>(

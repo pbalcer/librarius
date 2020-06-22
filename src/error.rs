@@ -45,8 +45,8 @@ pub enum Error {
     #[snafu(display("tried to open an uninitialized source"))]
     OpenOnUninitialized {},
 
-    #[snafu(display("tried to create a log entry larger than a pagesize"))]
-    LogEntryTooLarge {},
+    #[snafu(display("tried to create an allocation larger than a pagesize"))]
+    AllocationTooLarge {},
 
     #[snafu(display("incorrect page context length"))]
     ContextTooLarge {},

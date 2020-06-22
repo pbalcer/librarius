@@ -3,14 +3,14 @@ use crate::source::{Page, Source, SourceAllocator};
 use crate::utils::{crc, crc_slice, math, unsafe_utils, OptionExt};
 use memoffset::offset_of;
 use parking_lot::RwLock;
-use std::collections::BTreeMap;
+use std::collections::{hash_map::Entry, BTreeMap, HashMap};
 use std::mem::size_of;
 use std::ops::{Bound::Included, Deref, DerefMut};
-use std::sync::Arc;
+use std::{fmt::Debug, sync::Arc};
 
 pub type LogicalAddress = usize;
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct LogicalSlice {
     offset: LogicalAddress,
     len: usize,
@@ -19,6 +19,10 @@ pub struct LogicalSlice {
 impl LogicalSlice {
     pub fn new(offset: LogicalAddress, len: usize) -> Self {
         LogicalSlice { offset, len }
+    }
+
+    pub fn none() -> Self {
+        LogicalSlice::new(0, 0)
     }
 
     pub fn split_at(self, mid: usize) -> (Self, Self) {
@@ -59,6 +63,12 @@ impl LogicalSlice {
         Page::new(offset, len)
     }
 
+    fn page_aligned(&self, pagesize: usize) -> Self {
+        let offset = math::align_down(self.offset, pagesize);
+        let len = math::align_up(self.len, pagesize);
+        LogicalSlice::new(offset, len)
+    }
+
     pub fn address(&self) -> LogicalAddress {
         self.offset
     }
@@ -68,6 +78,7 @@ impl LogicalSlice {
     }
 }
 
+#[derive(Debug)]
 struct PageHeader {}
 
 impl PageHeader {
@@ -80,19 +91,28 @@ impl PageHeader {
     }
 }
 
+#[derive(Debug)]
 struct MetaData {
     slice: LogicalSlice,
 }
 
-pub const ROOT_SIZE: usize = 8;
-const ROOT_NONE: [u8; ROOT_SIZE] = [0; ROOT_SIZE];
+pub const ROOT_SIZE: usize = 64;
 
 struct Meta {
     hdr: PageHeader,
     data: MetaData,
     crc: u32,
     root: [u8; ROOT_SIZE],
-    root_crc: u32,
+}
+
+impl Debug for Meta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Meta")
+            .field("data", &self.data)
+            .field("crc", &self.crc)
+            .field("root", &self.root[8])
+            .finish()
+    }
 }
 
 impl Meta {
@@ -105,7 +125,6 @@ impl Meta {
             data,
             crc,
             root: [0; ROOT_SIZE],
-            root_crc: 0,
         }
     }
 
@@ -168,10 +187,62 @@ const CONTEXT_SIZE: usize = 16;
 
 pub type PageAlloc<'tx> = Box<dyn Fn() -> Result<LogicalMutRef<'tx>> + 'tx>;
 
+#[derive(Copy, Clone, Debug)]
+pub struct ByteLogicalSlice(pub LogicalSlice);
+
+#[derive(Copy, Clone, Debug)]
+pub struct BlockLogicalSlice(pub LogicalSlice);
+
+#[derive(Copy, Clone, Debug)]
+pub enum StoredLogicalSlice {
+    Block(BlockLogicalSlice),
+    Byte(ByteLogicalSlice),
+}
+
+impl StoredLogicalSlice {
+    pub fn new_byte(slice: LogicalSlice) -> Self {
+        StoredLogicalSlice::Byte(ByteLogicalSlice(slice))
+    }
+
+    pub fn new_block(slice: LogicalSlice) -> Self {
+        StoredLogicalSlice::Block(BlockLogicalSlice(slice))
+    }
+
+    pub fn new(slice: LogicalSlice, byte_addressable: bool) -> Self {
+        match byte_addressable {
+            true => Self::new_byte(slice),
+            false => Self::new_block(slice),
+        }
+    }
+
+    pub fn raw(&self) -> &LogicalSlice {
+        match self {
+            StoredLogicalSlice::Block(slice) => &slice.0,
+            StoredLogicalSlice::Byte(slice) => &slice.0,
+        }
+    }
+
+    pub fn unwrap_byte(self) -> ByteLogicalSlice {
+        match self {
+            StoredLogicalSlice::Block(_) => panic!("unwrap byte on block"),
+            StoredLogicalSlice::Byte(b) => b,
+        }
+    }
+
+    pub fn unwrap_block(self) -> BlockLogicalSlice {
+        match self {
+            StoredLogicalSlice::Block(b) => b,
+            StoredLogicalSlice::Byte(_) => panic!("unwrap block on byte"),
+        }
+    }
+}
+
 pub struct LogicalAddressSpace<'data> {
     sources: BTreeMap<LogicalAddress, Arc<SourceAllocator<'data>>>,
     pagesize: usize,
-    root: LogicalSlice,
+    root: StoredLogicalSlice,
+    root_bytes: ByteLogicalSlice,
+    backing: RwLock<HashMap<LogicalAddress, StoredLogicalSlice>>,
 }
 
 impl<'data> LogicalAddressSpace<'data> {
@@ -196,13 +267,15 @@ impl<'data> LogicalAddressSpace<'data> {
             allocator.read_into(&metapage, 0, &mut data)?;
             let metap: &mut Meta = unsafe_utils::any_from_slice_mut(data.as_mut_slice());
             if metap.is_valid() {
-                if metap.root != ROOT_NONE {
+                if !metap.root.iter().all(|v| *v == 0) {
                     if root.is_some() {
                         return Err(Error::RootExists {});
                     }
-                    root = Some(LogicalSlice::new(
-                        metap.slice().offset + offset_of!(Meta, root),
-                        ROOT_SIZE,
+                    let slice =
+                        LogicalSlice::new(metap.slice().offset + offset_of!(Meta, root), ROOT_SIZE);
+                    root = Some(StoredLogicalSlice::new(
+                        slice,
+                        allocator.is_byte_addressable(),
                     ));
                 };
                 let start = metap.slice().offset;
@@ -240,23 +313,52 @@ impl<'data> LogicalAddressSpace<'data> {
         let mut las = LogicalAddressSpace {
             sources,
             pagesize,
-            root: LogicalSlice::new(0, 0),
+            root: StoredLogicalSlice::new_byte(LogicalSlice::none()),
+            root_bytes: ByteLogicalSlice(LogicalSlice::none()),
+            backing: RwLock::new(HashMap::new()),
         };
 
         if root.is_none() {
             assert!(create);
+            println!("root none");
 
             let (base_offset, source) = las
-                .get_best_byte_addressable()
+                .get_best_persistent()
+                .or_else(|| las.get_best_byte_addressable())
                 .ok_or(Error::NoAvailableMemory {})?;
 
             let metapage = source.get_meta()?;
-            root = Some(LogicalSlice::new(
+            let slice = LogicalSlice::new(
                 base_offset + metapage.offset() + offset_of!(Meta, root),
                 ROOT_SIZE,
-            ));
+            );
+            let slice = StoredLogicalSlice::new(slice, source.is_byte_addressable());
+            root = Some(slice);
         }
         las.root = root.unwrap();
+
+        if let StoredLogicalSlice::Block(block) = &las.root {
+            let slice_aligned = block.0.page_aligned(pagesize);
+            let slice = StoredLogicalSlice::new_block(slice_aligned);
+
+            let root_bytes = las.fetch(&slice)?;
+            {
+                let data = las.read(&root_bytes)?;
+                let metap = unsafe_utils::any_from_slice::<Meta>(data);
+                println!("fetched {:?} {:?}", root_bytes, metap);
+            }
+
+            println!("inserting {:?} {:?}", root_bytes.0.address(), slice);
+            las.backing.write().insert(root_bytes.0.address(), slice);
+
+            let slice = LogicalSlice::new(
+                root_bytes.0.address() + offset_of!(Meta, root),
+                las.root.raw().len,
+            );
+            las.root_bytes = StoredLogicalSlice::new_byte(slice).unwrap_byte();
+        } else {
+            las.root_bytes = las.root.unwrap_byte().clone();
+        }
 
         Ok(las)
     }
@@ -287,30 +389,92 @@ impl<'data> LogicalAddressSpace<'data> {
         self.get_best_source(|s| s.is_byte_addressable())
     }
 
-    pub fn root_location(&self) -> LogicalSlice {
-        self.root
+    pub fn root_location(&self) -> &ByteLogicalSlice {
+        &self.root_bytes
     }
 
-    pub fn flush_root(&self) -> Result<()> {
-        todo!()
-        /*let root = self.root.read().unwrap();
-        let root_data = self.read(&root)?;
+    pub fn get_backing(&self, slice: &ByteLogicalSlice) -> Result<Option<StoredLogicalSlice>> {
+        let slice_aligned = slice.0.page_aligned(self.pagesize);
+        self.with_source(&slice_aligned, |base_offset, source| {
+            let page = slice_aligned.to_page(self.pagesize, base_offset);
+            let offset = slice.0.page_offset(page, base_offset);
 
-        let (base_offset, source) = self
-            .get_best_persistent()
-            .ok_or(Error::NoAvailableMemory {})?;
+            if source.is_persistent() {
+                return Ok(Some(StoredLogicalSlice::Byte(slice.clone())));
+            }
+            let backing = self.backing.read().get(&slice_aligned.address()).copied();
+            if let Some(backing) = backing {
+                let slice = LogicalSlice::new(backing.raw().address() + offset, slice.0.len);
+                Ok(Some(match backing {
+                    StoredLogicalSlice::Block(_) => StoredLogicalSlice::new_block(slice),
+                    StoredLogicalSlice::Byte(_) => StoredLogicalSlice::new_byte(slice),
+                }))
+            } else {
+                Ok(None)
+            }
+        })
+    }
 
-        let metapage = source.get_meta()?;
+    fn allocate_backing(&self, key: LogicalAddress) -> Result<()> {
+        match self.backing.write().entry(key) {
+            Entry::Occupied(_) => {}
+            Entry::Vacant(v) => {
+                let (base_offset, allocator) = self
+                    .get_best_persistent()
+                    .ok_or(Error::NoAvailableMemory {})?;
+                let page = allocator.allocate_page()?;
+                let slice_new = LogicalSlice::from_page(page, base_offset);
+                v.insert(StoredLogicalSlice::new(
+                    slice_new,
+                    allocator.is_byte_addressable(),
+                ));
+            }
+        }
+        Ok(())
+    }
 
-        let mut data = vec![0; self.pagesize];
-        source.read_into(&metapage, 0, &mut data)?;
-        let metap: &mut Meta = unsafe_utils::any_from_slice_mut(data.as_mut_slice());
-        metap.root.copy_from_slice(root_data);
-        metap.root_crc = crc_slice(root_data);
+    pub fn flush(&self, slice: &ByteLogicalSlice) -> Result<StoredLogicalSlice> {
+        let slice_aligned = slice.0.page_aligned(self.pagesize);
 
-        source.write_from(&metapage, 0, data.as_slice())?;
+        /* XXX: this is really inefficient and always flushes the entire page... */
+        self.with_source(&slice_aligned, |base_offset, source| {
+            assert!(source.is_byte_addressable());
+            let page = slice_aligned.to_page(self.pagesize, base_offset);
+            let data = source.get_bytes(&page)?.unwrap();
+            let offset = slice.0.page_offset(page, base_offset);
 
-        Ok(())*/
+            if source.is_persistent() {
+                source.flush_partial(data)?;
+                Ok(StoredLogicalSlice::Byte(slice.clone()))
+            } else {
+                let backing = self.backing.read().get(&slice_aligned.address()).copied();
+                if let Some(backing) = backing {
+                    println!("flushing {:?} {:?}", slice_aligned.address(), backing);
+                    self.with_source(&backing.raw(), |dst_base_offset, dst_source| {
+                        assert!(dst_source.is_persistent());
+
+                        let dst_page = backing.raw().to_page(self.pagesize, dst_base_offset);
+                        println!("writing data... {:?}", dst_page);
+                        if dst_page.offset() == 4096 {
+                            let metap = unsafe_utils::any_from_slice::<Meta>(data);
+                            println!("flushing {:?} {:?}", slice_aligned, metap);
+                        }
+                        dst_source.write_from(&dst_page, 0, data)?;
+
+                        Ok(())
+                    })?;
+
+                    let slice = LogicalSlice::new(backing.raw().address() + offset, slice.0.len);
+                    Ok(match backing {
+                        StoredLogicalSlice::Block(_) => StoredLogicalSlice::new_block(slice),
+                        StoredLogicalSlice::Byte(_) => StoredLogicalSlice::new_byte(slice),
+                    })
+                } else {
+                    self.allocate_backing(slice_aligned.address())?;
+                    self.flush(slice)
+                }
+            }
+        })
     }
 
     pub fn alloc<'tx>(&'tx self) -> Result<LogicalMutRef<'tx>>
@@ -353,56 +517,58 @@ impl<'data> LogicalAddressSpace<'data> {
         f(*base_offset, source.clone())
     }
 
-    pub fn cancel(&self, mref: LogicalMutRef<'data>) {
-        let err = self.with_source(&mref.slice, |base_offset, source| {
-            source.free_page(mref.slice.to_page(self.pagesize, base_offset))
-        });
-        debug_assert!(err.is_ok())
-    }
+    pub fn read(&self, slice: &ByteLogicalSlice) -> Result<&'data [u8]> {
+        let raw = &slice.0;
+        self.with_source(raw, |base_offset, source| {
+            assert!(source.is_byte_addressable());
+            let page = raw.to_page(self.pagesize, base_offset);
 
-    pub fn flush(&self, slice: &LogicalSlice) -> Result<()> {
-        todo!()
-    }
+            let data = source.get_bytes(&page)?.unwrap();
 
-    fn read_from_storage(&self, slice: &LogicalSlice) -> Result<LogicalSlice> {
-        todo!()
-    }
+            let start = raw.page_offset(page, base_offset);
+            let end = start + raw.len();
+            let data = &data[start..end];
 
-    pub fn read(&self, slice: &LogicalSlice) -> Result<&'data [u8]> {
-        self.with_source(slice, |base_offset, source| {
-            let page = slice.to_page(self.pagesize, base_offset);
-
-            let data: Option<&'data [u8]> = source.get_bytes(&page)?;
-
-            if let Some(data) = data {
-                let start = slice.page_offset(page, base_offset);
-                let end = start + slice.len();
-                let data = &data[start..end];
-
-                Ok(data)
-            } else {
-                todo!()
-            }
+            Ok(data)
         })
     }
 
-    pub fn write(&self, slice: &LogicalSlice) -> Result<LogicalMutRef<'data>> {
-        self.with_source(slice, |base_offset, source| {
-            let page = slice.to_page(self.pagesize, base_offset);
+    pub fn fetch(&self, slice: &StoredLogicalSlice) -> Result<ByteLogicalSlice> {
+        let raw = slice.raw();
+        let mut src_data = vec![0 as u8; self.pagesize];
 
-            let data: Option<&'data mut [u8]> = source.get_bytes_mut(&page)?;
+        let offset = self.with_source(raw, |base_offset, source| {
+            let page = raw.to_page(self.pagesize, base_offset);
 
-            if let Some(data) = data {
-                let (hdrp, datap) = data.split_at_mut(size_of::<PageHeader>());
+            source.read_into(&page, 0, src_data.as_mut_slice())?;
 
-                let start = slice.page_offset(page, base_offset) - size_of::<PageHeader>();
-                let end = start + slice.len();
-                let data = &mut datap[start..end];
+            Ok(raw.page_offset(page, base_offset))
+        })?;
 
-                Ok(LogicalMutRef::new(data, slice.clone()))
-            } else {
-                todo!()
-            }
+        let mut page = self.alloc()?;
+
+        page.copy_from_slice(src_data.as_slice());
+
+        println!("fetch with {}", offset);
+
+        let slice = LogicalSlice::new(page.slice.address() + offset, raw.len);
+
+        Ok(ByteLogicalSlice(slice))
+    }
+
+    pub fn write(&self, slice: &ByteLogicalSlice) -> Result<&'data mut [u8]> {
+        let raw = &slice.0;
+        self.with_source(raw, |base_offset, source| {
+            assert!(source.is_byte_addressable());
+            let page = raw.to_page(self.pagesize, base_offset);
+
+            let data = source.get_bytes_mut(&page)?.unwrap();
+
+            let start = raw.page_offset(page, base_offset);
+            let end = start + raw.len();
+            let data = &mut data[start..end];
+
+            Ok(data)
         })
     }
 }
@@ -410,7 +576,9 @@ impl<'data> LogicalAddressSpace<'data> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::is_enum_variant;
     use crate::source::MemorySource;
+
     use std::iter;
 
     #[test]
@@ -421,10 +589,13 @@ mod tests {
         let root = las.root_location();
 
         let slice = las.read(&root)?;
-
         let data = [0 as u8; ROOT_SIZE];
 
-        assert_eq!(data, slice.deref());
+        let result = las.flush(root);
+        assert!(is_enum_variant!(
+            result.unwrap_err(),
+            Error::NoAvailableMemory {}
+        ));
 
         Ok(())
     }

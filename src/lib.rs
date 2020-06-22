@@ -14,5 +14,5 @@ pub use crate::librarius::{Librarius, LibrariusBuilder};
 pub use error::{Error, Result};
 pub use source::{FileSource, MemorySource, Source};
 pub use tx::Transaction;
-pub use typed::{Persistent, TypedLibrariusBuilder, TypedTransaction};
-pub use vos::UntypedPointer;
+pub use typed::{Persistent, PersistentPointer, TypedLibrariusBuilder, TypedTransaction};
+pub use vos::{ObjectSize, UntypedPointer};
