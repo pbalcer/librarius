@@ -1,3 +1,5 @@
+![Rust](https://github.com/pbalcer/librarius/workflows/Rust/badge.svg?branch=master)
+
 # **librarius: Multi-tier MVOCC storage engine (WIP)**
 
 *Here be dragons.*
