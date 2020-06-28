@@ -691,7 +691,7 @@ be registered while the librarius is being opened. Then, if there's a
 log with a lattice modification, but the merge operator is not registered,
 the open would fail.
 
-# Streaming replication
+## Streaming replication
 
 TBD...
 But the general idea is to provide an asynchronous stream of commited data,
@@ -699,5 +699,22 @@ which can then be consumed (or not) to physically replicate data. Such a replica
 can be then opened as a librarius source if needed and it will present some
 consistent view of the heap.
 
+## NUMA-awareness
 
+I discussed NUMA a little bit with root objects. In general, whenever "best"
+is used in context of memory allocation, this also means "best for the NUMA node
+of this thread". The source abstraction requires that sources identify to
+which NUMA node they are connected to. This information is then use to determine
+what's the best source (Target) for the thread (Initiator), based on data
+from libnuma.
 
+However, there's also the problem of scheduling of the Futures produced by the
+storage engine. I brought up this topic on Rust Internals forum:
+https://internals.rust-lang.org/t/support-for-heterogenous-memory-systems/12460/7
+
+Basically, the problem boils down to communicating to the executor which NUMA
+nodes should be preferred for a Future. This is impossible right now, but
+should be implementable as a specialized crate that exposes locality-aware
+future. Then, the executor could optionally support this type of future.
+Right now the plan is to talk with some of the developers behind async ecosystems
+in Rust (Tokio, async-std, smol) and convince them to address this gap.
