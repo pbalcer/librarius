@@ -4,6 +4,8 @@
 
 *Here be dragons.*
 
+For details about the implementation see the [design](DESIGN.md) doc.
+
 ## Goals
 
  - Compile-time race- and deadlock- freedom
@@ -88,7 +90,7 @@ Background information and glossary in [14].
 
 [3] - https://15721.courses.cs.cmu.edu/spring2020/papers/05-mvcc3/p128-bottcher.pdf
 
-[4] - http://justinlevandoski.org/papers/ICDE18_mwcas.pdf
+[4] - https://www.cl.cam.ac.uk/research/srg/netos/papers/2002-casn.pdf
 
 [5] - https://www.microsoft.com/en-us/research/uploads/prod/2018/03/faster-sigmod18.pdf
 
