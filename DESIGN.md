@@ -596,7 +596,7 @@ Write transactions that encounter a commited log (e.g., another set), check if
 the two logs operations are conflict-free, and if so - the write transaction
 can proceed, otherwise it will abort.
 
-Sets simply create a new log entry, and appends the log pointer to the pointer of
+Sets simply create a new log entry, and append the log pointer to the pointer of
 the object it's modifying.
 
 The alloc operation allocates a new object of a given size with an indirect
@@ -619,6 +619,9 @@ there's no need to keep the read-set of a transaction.
 Note: is this optimal? probably not, but it's the simplest way to prevent
 write skew I came up with that was easy to be made "scalable" (at least for readers).
 Once implemented, I need to see if there isn't a livelock issue...
+Wild idea: I could probably add a futex-thingy with exponential backoff so that
+transactions go to sleep instead of repeatedly aborting on a transaction. But
+let's not reinvent fair mutexes :)
 
 Once a read-only transaction finishes, it simply drops its versioned reader,
 which will commit its read version, enabling GC/eviction/replacement to run.
@@ -652,10 +655,10 @@ The log can only be removed once all modification requests are fullfiled.
 
 ## Recovery
 
-The mechanism described is effectively a simple redo log.
+The mechanism described is effectively a redo log.
 During recovery, the root location is opened and the chain of logs is
-processed. It will apply any pending modifications. All extents but the latest
-one is discarded after processing.
+processed. It will apply any pending modifications. All logs extents but the
+latest one are discarded after processing.
 
 The VAS is updated with the commited version of the last log extent.
 
@@ -664,7 +667,7 @@ The VAS is updated with the commited version of the last log extent.
 The current design doesn't really allow for any CAS-style lock-free programming.
 Why? Because CAS inherently creates dependencies between running write threads.
 In a transaction that would mean that if there are any two transactions that
-used CAS on a set of dependent objects, those two transactions would be themselves
+used CAS on a set of dependent objects, those two transactions would themselves
 become depedent - i.e., they either both commit or both abort. And this
 generalizes beyond just two transactions. What's worse, is that once
 a transaction finishes, it has to wait for other codependent transactions
@@ -681,11 +684,11 @@ between transactions, causing livelock issues and high latency.
 
 ## Lattices
 
-A lattice is logically an object containing some value T and a merge operator F.
-The merge operator F needs to be a persistent, or at least must be available
+A lattice is logically an object containing some value T and a merge operator `Fn(T, T) -> T`.
+The merge operator needs to be persistent, or at least must be available
 during recovery. Otherwise, any conflicts would have to be resolved at commit
 time, and the actual merged value would have to be written in the log,
-instead of the entire lattice.
+instead of the entire lattice. This would again create codependent transactions.
 Right now I'm leaning towards an interface where lattice types would have to
 be registered while the librarius is being opened. Then, if there's a
 log with a lattice modification, but the merge operator is not registered,

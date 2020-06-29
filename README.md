@@ -4,7 +4,7 @@
 
 *Here be dragons.*
 
-For details about the implementation see the [design](DESIGN.md) doc.
+For details about the implementation, see the [design](DESIGN.md) doc.
 
 ## Goals
 
